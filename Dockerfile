@@ -1,13 +1,9 @@
 FROM mcr.microsoft.com/playwright:v1.62.1-jammy
-
 WORKDIR /app
-
-COPY package.json package-lock.json* ./
-RUN npm ci
-
-RUN npx playwright install chromium
-
+COPY package.json ./
+RUN npm install --omit=dev
+RUN npx playwright install chromium --with-deps || true
 COPY . .
-
-EXPOSE 3000
+ENV PORT=8080
+EXPOSE 8080
 CMD ["node", "server.js"]

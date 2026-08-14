@@ -78,6 +78,22 @@ function bearerEmail(token) {
   return String(d.email || d.auth0Email || d.preferred_username || "").toLowerCase();
 }
 
+/**
+ * Hanya JWT yang benar-benar diterima backend Leonardo (Hasura) yang boleh
+ * disimpan. Token session better-auth juga berbentuk JWT dan masa berlakunya
+ * lebih panjang, sehingga kalau ikut dipilih provider membalas
+ * "Could not verify JWT: JWSError JWSInvalidSignature".
+ */
+function isLeonardoApiJwt(token) {
+  const d = decodeJwt(token);
+  if (!d || !d.exp) return false;
+  if (d["https://hasura.io/jwt/claims"]) return true;
+  const iss = String(d.iss || "");
+  // Token Cognito/Auth0 milik Leonardo — dipakai sebagai Authorization di API.
+  if (/cognito|auth0|leonardo/i.test(iss)) return true;
+  return false;
+}
+
 async function sync(path, init = {}) {
   if (!SYNC_URL) throw new Error("SYNC_URL belum diisi");
   const res = await fetch(`${SYNC_URL}${path}`, {
@@ -179,22 +195,22 @@ async function captureBearer(account) {
     page.on("request", (req) => {
       const auth = req.headers()["authorization"];
       if (!auth) return;
+      const target = req.url();
+      // Abaikan header Authorization dari domain lain (analitik, dsb).
+      if (!/leonardo\.ai/i.test(target)) return;
       const jwt = String(auth).replace(/^Bearer\s+/i, "").trim();
-      if (JWT_RE.test(jwt)) found.push(jwt);
+      if (JWT_RE.test(jwt) && isLeonardoApiJwt(jwt)) found.push(jwt);
     });
 
     await page.goto("https://app.leonardo.ai/", { waitUntil: "domcontentloaded", timeout: 60000 });
 
-    // Jalur cepat: endpoint session milik better-auth biasanya memuat access token.
+    // Pancing panggilan API asli supaya Bearer Hasura muncul di header request.
+    // Token dari /api/auth/session TIDAK dipakai: itu session better-auth dan
+    // ditolak GraphQL Leonardo (JWSInvalidSignature).
     try {
-      const session = await page.evaluate(async () => {
-        const res = await fetch("/api/auth/session", { credentials: "include" });
-        if (!res.ok) return null;
-        return await res.json();
+      await page.evaluate(async () => {
+        try { await fetch("/api/rest/getUserDetails", { credentials: "include" }); } catch {}
       });
-      const fromSession =
-        session?.session?.accessToken || session?.session?.token || session?.accessToken || session?.token;
-      if (fromSession && JWT_RE.test(String(fromSession))) found.push(String(fromSession));
     } catch {
       /* abaikan, andalkan sniff request */
     }

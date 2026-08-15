@@ -170,7 +170,7 @@ function buildCookies(raw) {
         secure: item.secure !== false,
         sameSite: "Lax",
       });
-    }
+    });
   }
   return cookies;
 }
@@ -266,7 +266,18 @@ async function captureBearer(account) {
 }
 
 async function refreshAccount(account) {
-  const captured = await captureBearer(account);
+  let captured;
+  try {
+    captured = await captureBearer(account);
+  } catch (e) {
+    // Chromium kadang crash (RAM instance). Coba sekali lagi sebelum dianggap gagal.
+    if (/Page crashed|Target closed|browser has been closed/i.test(String(e?.message || e))) {
+      log("retry karena browser crash:", account.label || account.id);
+      captured = await captureBearer(account);
+    } else {
+      throw e;
+    }
+  }
   await sync("", {
     method: "POST",
     body: JSON.stringify({
@@ -324,9 +335,21 @@ async function runCycle(reason = "timer", options = {}) {
     const now = Date.now();
     const requested = new Set(requestedIds);
     const candidates = forceSelected ? (rows || []).filter((r) => requested.has(String(r.id))) : (rows || []);
+    // Prioritas: akun rusak / mati dulu, lalu token yang paling cepat kedaluwarsa.
+    // Tanpa ini, list dari server (urut updated_at desc) selalu menaruh akun yang
+    // baru sukses di depan sehingga akun rusak tak pernah masuk MAX_PER_CYCLE.
+    const priority = (r) => {
+      const st = String(r.status || "").toLowerCase();
+      const broken = r.is_active === false || ["needs_refresh", "expired", "error", "invalid"].includes(st);
+      return broken ? 0 : 1;
+    };
+    const expMs = (r) => (r.expires_at ? new Date(r.expires_at).getTime() : 0);
+    const sorted = [...candidates].sort(
+      (a, b) => priority(a) - priority(b) || expMs(a) - expMs(b),
+    );
     const queue = forceSelected || forceAllNeeded
-      ? candidates
-      : candidates.filter((r) => (cooldown.get(r.id) || 0) <= now).slice(0, MAX_PER_CYCLE);
+      ? sorted
+      : sorted.filter((r) => (cooldown.get(r.id) || 0) <= now).slice(0, MAX_PER_CYCLE);
     const mode = forceSelected ? "capture paksa terpilih" : forceAllNeeded ? "manual semua kandidat" : "otomatis";
     log(`siklus ${reason}: ${candidates.length} kandidat, proses ${queue.length} (${mode})`);
 

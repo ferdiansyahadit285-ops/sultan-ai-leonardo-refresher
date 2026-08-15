@@ -42,7 +42,16 @@ const CYCLE_INTERVAL_MS = Number(process.env.CYCLE_INTERVAL_MS || 120000);
 const ACCOUNT_COOLDOWN_MS = Number(process.env.ACCOUNT_COOLDOWN_MS || 15 * 60 * 1000);
 const PAGE_WAIT_MS = Number(process.env.PAGE_WAIT_MS || 25000);
 const MAX_PER_CYCLE = Math.max(1, Number(process.env.MAX_PER_CYCLE || 20));
-const CONCURRENCY = Math.max(1, Number(process.env.CONCURRENCY || 3));
+// Chromium di instance kecil (Railway/Render 512MB–1GB) gampang kena OOM =>
+// "Page crashed". Default 1 worker; naikkan lewat env kalau RAM besar.
+const CONCURRENCY = Math.max(1, Number(process.env.CONCURRENCY || 1));
+// Berapa kali satu akun dicoba ulang dalam satu siklus sebelum ditandai gagal.
+const ACCOUNT_RETRIES = Math.max(1, Number(process.env.ACCOUNT_RETRIES || 3));
+// Akun yang gagal hanya "didinginkan" singkat supaya siklus berikutnya (2 menit)
+// langsung mencobanya lagi — tidak boleh dibiarkan mati berjam-jam.
+const FAIL_COOLDOWN_MS = Number(process.env.FAIL_COOLDOWN_MS || 60 * 1000);
+// Push manual menunggu siklus berjalan selesai maksimal selama ini.
+const MANUAL_WAIT_MS = Number(process.env.MANUAL_WAIT_MS || 10 * 60 * 1000);
 const USER_AGENT =
   process.env.USER_AGENT ||
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36";
@@ -123,7 +132,16 @@ async function getBrowser() {
   if (!browserPromise) {
     browserPromise = loadChromium().launch({
       headless: true,
-      args: ["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--disable-extensions",
+        "--disable-background-networking",
+        "--disable-blink-features=AutomationControlled",
+        "--js-flags=--max-old-space-size=256",
+      ],
     });
   }
   const b = await browserPromise;
@@ -132,6 +150,16 @@ async function getBrowser() {
     return getBrowser();
   }
   return b;
+}
+
+/** Tutup paksa browser supaya siklus berikutnya memakai proses baru (anti-OOM). */
+async function resetBrowser() {
+  const p = browserPromise;
+  browserPromise = null;
+  try {
+    const b = await p;
+    await b?.close();
+  } catch { /* ignore */ }
 }
 
 /** Ubah kolom `cookies` jsonb akun menjadi cookie Playwright untuk .leonardo.ai */
@@ -170,7 +198,7 @@ function buildCookies(raw) {
         secure: item.secure !== false,
         sameSite: "Lax",
       });
-    });
+    }
   }
   return cookies;
 }
@@ -192,6 +220,14 @@ async function captureBearer(account) {
   try {
     await context.addCookies(cookies);
     const page = await context.newPage();
+
+    // Hemat RAM: blokir aset berat (gambar, video, font, css) — bearer tetap
+    // tertangkap karena hanya request API yang dibutuhkan.
+    await page.route("**/*", (route) => {
+      const type = route.request().resourceType();
+      if (["image", "media", "font", "stylesheet"].includes(type)) return route.abort();
+      return route.continue();
+    });
 
     page.on("request", (req) => {
       const auth = req.headers()["authorization"];
@@ -245,7 +281,7 @@ async function captureBearer(account) {
 
     // Ambil ulang cookie sesi (better-auth merotasi session_token).
     const fresh = await context.cookies("https://app.leonardo.ai/");
-    const byName = new Map(fresh.map((c) => [c.name, c]));
+    const byName = new Map(fresh.map((c) => [c.name, c.value]));
     const pick = (...names) => names.map((n) => byName.get(n)).find(Boolean) || null;
     const tok = pick("__Secure-better-auth.session_token", "better-auth.session_token");
     const d0 = pick("__Secure-better-auth.session_data.0", "better-auth.session_data.0");
@@ -255,9 +291,9 @@ async function captureBearer(account) {
     return {
       bearer_token: best,
       bearer_exp: new Date(bestExp).toISOString(),
-      cookie_session_token: tok?.value || "",
-      cookie_session_data_0: d0?.value || "",
-      cookie_session_data_1: d1?.value || "",
+      cookie_session_token: tok || "",
+      cookie_session_data_0: d0 || "",
+      cookie_session_data_1: d1 || "",
       cookies_exp: expSec ? new Date(expSec * 1000).toISOString() : null,
     };
   } finally {
@@ -267,17 +303,27 @@ async function captureBearer(account) {
 
 async function refreshAccount(account) {
   let captured;
-  try {
-    captured = await captureBearer(account);
-  } catch (e) {
-    // Chromium kadang crash (RAM instance). Coba sekali lagi sebelum dianggap gagal.
-    if (/Page crashed|Target closed|browser has been closed/i.test(String(e?.message || e))) {
-      log("retry karena browser crash:", account.label || account.id);
+  // Semua kegagalan (crash Chromium karena RAM kecil, timeout jaringan, cookie
+  // belum termuat) dicoba ulang: tutup browser lama, tunggu, ulangi.
+  let lastError;
+  for (let attempt = 1; attempt <= ACCOUNT_RETRIES; attempt++) {
+    try {
       captured = await captureBearer(account);
-    } else {
-      throw e;
+      lastError = null;
+      break;
+    } catch (e) {
+      lastError = e;
+      if (attempt === ACCOUNT_RETRIES) break;
+      log(
+        `retry ${attempt}/${ACCOUNT_RETRIES - 1}`,
+        account.label || account.email || account.id,
+        String(e?.message || e).slice(0, 160),
+      );
+      await resetBrowser();
+      await new Promise((r) => setTimeout(r, 3000 * attempt));
     }
   }
+  if (lastError || !captured) throw lastError || new Error("capture gagal tanpa detail");
   await sync("", {
     method: "POST",
     body: JSON.stringify({
@@ -319,7 +365,21 @@ async function markFailure(account, message) {
 }
 
 async function runCycle(reason = "timer", options = {}) {
-  if (running) return { skipped: true, reason: "cycle sedang jalan" };
+  if (running) {
+    // Push manual TIDAK boleh ditolak: tunggu siklus berjalan selesai lalu
+    // langsung jalan. Timer otomatis cukup dilewati (siklus 2 menit berikutnya).
+    if (reason !== "manual") {
+      return { ok: false, skipped: true, reason: "siklus sebelumnya masih berjalan", results: [] };
+    }
+    const deadline = Date.now() + MANUAL_WAIT_MS;
+    log("push manual menunggu siklus berjalan selesai…");
+    while (running && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 1500));
+    }
+    if (running) {
+      return { ok: false, skipped: true, reason: "siklus lain belum selesai setelah menunggu", results: [] };
+    }
+  }
   running = true;
   const results = [];
   try {
@@ -367,7 +427,7 @@ async function runCycle(reason = "timer", options = {}) {
           log("✅ refresh", label, "->", exp);
         } catch (e) {
           await markFailure(account, e.message);
-          cooldown.set(account.id, Date.now() + Math.min(ACCOUNT_COOLDOWN_MS, 10 * 60 * 1000));
+          cooldown.set(account.id, Date.now() + FAIL_COOLDOWN_MS);
           results.push({ id: account.id, label, status: "failed", error: e.message });
           state.errors += 1;
           log("❌ refresh gagal", label, e.message);
@@ -377,6 +437,30 @@ async function runCycle(reason = "timer", options = {}) {
     await Promise.all(
       Array.from({ length: Math.min(CONCURRENCY, pending.length || 1) }, () => worker()),
     );
+
+    // Sapuan kedua: akun yang masih gagal dicoba sekali lagi dengan browser baru
+    // supaya "akun mati" tidak dibiarkan gagal begitu saja.
+    const stillFailed = results.filter((r) => r.status === "failed");
+    if (stillFailed.length) {
+      await resetBrowser();
+      log(`sapuan ulang untuk ${stillFailed.length} akun gagal`);
+      for (const failed of stillFailed) {
+        const account = queue.find((r) => String(r.id) === String(failed.id));
+        if (!account) continue;
+        try {
+          const exp = await refreshAccount(account);
+          cooldown.set(account.id, Date.now() + ACCOUNT_COOLDOWN_MS);
+          failed.status = "refreshed";
+          failed.expires_at = exp;
+          delete failed.error;
+          log("✅ refresh (sapuan ulang)", failed.label, "->", exp);
+        } catch (e) {
+          await markFailure(account, e.message);
+          failed.error = e.message;
+          log("❌ tetap gagal", failed.label, e.message);
+        }
+      }
+    }
   } catch (e) {
     state.errors += 1;
     log("siklus gagal", e.message);
@@ -386,6 +470,8 @@ async function runCycle(reason = "timer", options = {}) {
     state.cycles += 1;
     state.last_cycle_at = new Date().toISOString();
     state.last_result = results;
+    // Bebaskan memori setelah siklus selesai supaya siklus berikutnya bersih.
+    await resetBrowser();
   }
   return { ok: true, results };
 }

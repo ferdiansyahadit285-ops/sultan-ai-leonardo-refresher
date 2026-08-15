@@ -1,515 +1,387 @@
-/**
- * Sultan AI — Leonardo Auto Refresher (VPS)
- *
- * Pengganti extension Chrome di PC: service ini jalan 24/7 di VPS, membuka
- * app.leonardo.ai dengan cookie sesi tiap akun pool memakai Chromium headless,
- * menyadap Bearer JWT asli, lalu menyimpannya kembali ke pool lewat Edge
- * Function `leonardo-refresher-sync`.
- *
- * Endpoint:
- *   GET  /health   -> status service + statistik siklus terakhir
- *   POST /run      -> jalankan siklus refresh sekarang (butuh Bearer secret)
- *
- * Env wajib:
- *   SYNC_URL          = https://<project>.supabase.co/functions/v1/leonardo-refresher-sync
- *   SUPABASE_ANON_KEY = publishable key proyek (dipakai sebagai apikey header)
- *   REFRESHER_SECRET  = nilai LEONARDO_REFRESH_SECRET di backend
- * Env opsional:
- *   CONTROL_SECRET    = secret untuk POST /run (default: REFRESHER_SECRET)
- *   CYCLE_INTERVAL_MS = jarak antar siklus (default 120000)
- *   ACCOUNT_COOLDOWN_MS = cooldown per akun setelah sukses (default 900000)
- *   PAGE_WAIT_MS      = lama menunggu halaman mencetak bearer (default 25000)
- *   MAX_PER_CYCLE     = maksimal akun diproses per siklus otomatis (default 20)
- */
-const express = require("express");
-// playwright di-require malas (lazy) supaya service tetap hidup & /health tetap
-// menjawab walaupun browser Chromium belum tersedia di platform hosting.
-let chromium = null;
-function loadChromium() {
-  if (!chromium) chromium = require("playwright").chromium;
-  return chromium;
-}
+import express from "express";
+import { chromium } from "playwright-extra";
+import stealthPlugin from "puppeteer-extra-plugin-stealth";
+import RecaptchaPlugin from "puppeteer-extra-plugin-recaptcha";
+import { createClient } from "@supabase/supabase-js";
+import crypto from "crypto";
+
+chromium.use(stealthPlugin());
+chromium.use(
+  RecaptchaPlugin({
+    provider: { id: "2captcha", token: process.env.TWOCAPTCHA_TOKEN || "" },
+    throwOnError: false,
+  })
+);
 
 const app = express();
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json());
 
-const PORT = process.env.PORT || 8080;
-const SYNC_URL = (process.env.SYNC_URL || "").replace(/\/+$/, "");
-const ANON_KEY = process.env.SUPABASE_ANON_KEY || "";
-const REFRESHER_SECRET = process.env.REFRESHER_SECRET || "";
-const CONTROL_SECRET = process.env.CONTROL_SECRET || REFRESHER_SECRET;
-const CYCLE_INTERVAL_MS = Number(process.env.CYCLE_INTERVAL_MS || 120000);
-const ACCOUNT_COOLDOWN_MS = Number(process.env.ACCOUNT_COOLDOWN_MS || 15 * 60 * 1000);
-const PAGE_WAIT_MS = Number(process.env.PAGE_WAIT_MS || 25000);
-const MAX_PER_CYCLE = Math.max(1, Number(process.env.MAX_PER_CYCLE || 20));
-// Chromium di instance kecil (Railway/Render 512MB–1GB) gampang kena OOM =>
-// "Page crashed". Default 1 worker; naikkan lewat env kalau RAM besar.
-const CONCURRENCY = Math.max(1, Number(process.env.CONCURRENCY || 1));
-// Berapa kali satu akun dicoba ulang dalam satu siklus sebelum ditandai gagal.
-const ACCOUNT_RETRIES = Math.max(1, Number(process.env.ACCOUNT_RETRIES || 3));
-// Akun yang gagal hanya "didinginkan" singkat supaya siklus berikutnya (2 menit)
-// langsung mencobanya lagi — tidak boleh dibiarkan mati berjam-jam.
-const FAIL_COOLDOWN_MS = Number(process.env.FAIL_COOLDOWN_MS || 60 * 1000);
-// Push manual menunggu siklus berjalan selesai maksimal selama ini.
-const MANUAL_WAIT_MS = Number(process.env.MANUAL_WAIT_MS || 10 * 60 * 1000);
-const USER_AGENT =
-  process.env.USER_AGENT ||
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36";
+const SUPABASE_URL = process.env.SUPABASE_URL || "";
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
+const REFRESH_SECRET = process.env.REFRESH_SECRET || "";
+const PORT = process.env.PORT || 3000;
+const CONCURRENCY = Math.max(1, Math.min(3, parseInt(process.env.CONCURRENCY || "1", 10)));
+const HEADLESS = process.env.HEADLESS !== "false";
+const MAX_PER_CYCLE = parseInt(process.env.MAX_PER_CYCLE || "30", 10);
+const COOLDOWN_MS = parseInt(process.env.COOLDOWN_MS || "60000", 10);
+const FUNCTION_COOLDOWN_MS = parseInt(process.env.FUNCTION_COOLDOWN_MS || "30000", 10);
 
-const JWT_RE = /eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}/;
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
-let browserPromise = null;
-let running = false;
-const cooldown = new Map(); // account_id -> timestamp boleh diproses lagi
-const state = { last_cycle_at: null, last_result: [], cycles: 0, errors: 0 };
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const now = () => new Date().toISOString();
 
-function log(...args) {
-  console.log(new Date().toISOString(), ...args);
-}
-
-function decodeJwt(token) {
-  try {
-    const part = String(token).split(".")[1];
-    const json = Buffer.from(part.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8");
-    return JSON.parse(json);
-  } catch {
-    return null;
-  }
-}
-
-function bearerExpIso(token) {
-  const d = decodeJwt(token);
-  if (!d?.exp) return null;
-  return new Date(d.exp * 1000).toISOString();
-}
-
-function bearerEmail(token) {
-  const d = decodeJwt(token) || {};
-  return String(d.email || d.auth0Email || d.preferred_username || "").toLowerCase();
-}
-
-/**
- * Hanya JWT yang benar-benar diterima backend Leonardo (Hasura) yang boleh
- * disimpan. Token session better-auth juga berbentuk JWT dan masa berlakunya
- * lebih panjang, sehingga kalau ikut dipilih provider membalas
- * "Could not verify JWT: JWSError JWSInvalidSignature".
- */
-function isLeonardoApiJwt(token) {
-  const d = decodeJwt(token);
-  if (!d || !d.exp) return false;
-  if (d["https://hasura.io/jwt/claims"]) return true;
-  const iss = String(d.iss || "");
-  // Token Cognito/Auth0 milik Leonardo — dipakai sebagai Authorization di API.
-  if (/cognito|auth0|leonardo/i.test(iss)) return true;
-  return false;
-}
-
-async function sync(path, init = {}) {
-  if (!SYNC_URL) throw new Error("SYNC_URL belum diisi");
-  const res = await fetch(`${SYNC_URL}${path}`, {
-    ...init,
-    headers: {
-      "Content-Type": "application/json",
-      "x-refresher-secret": REFRESHER_SECRET,
-      ...(ANON_KEY ? { apikey: ANON_KEY, Authorization: `Bearer ${ANON_KEY}` } : {}),
-      ...(init.headers || {}),
-    },
-  });
-  const text = await res.text();
-  let json = null;
-  try {
-    json = JSON.parse(text);
-  } catch {
-    /* biarkan null */
-  }
-  if (!res.ok || json?.ok === false) {
-    throw new Error(`sync ${path} gagal (${res.status}): ${json?.error || text.slice(0, 200)}`);
-  }
-  return json || {};
-}
+let browser = null;
+let context = null;
+let isBusy = false;
+let lastRunAt = 0;
+let queue = [];
 
 async function getBrowser() {
-  if (!browserPromise) {
-    browserPromise = loadChromium().launch({
-      headless: true,
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-gpu",
-        "--disable-extensions",
-        "--disable-background-networking",
-        "--disable-blink-features=AutomationControlled",
-        "--js-flags=--max-old-space-size=256",
-      ],
-    });
+  if (browser && context) {
+    try {
+      const pages = await context.pages();
+      if (pages.length > 0) return { browser, context };
+    } catch (e) {
+      console.log("[browser] context rusak, reset");
+    }
   }
-  const b = await browserPromise;
-  if (!b.isConnected()) {
-    browserPromise = null;
-    return getBrowser();
+  if (browser) {
+    try {
+      await browser.close();
+    } catch {}
   }
-  return b;
+  browser = await chromium.launch({
+    headless: HEADLESS,
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",
+      "--disable-gpu",
+      "--disable-web-security",
+      "--disable-features=IsolateOrigins,site-per-process",
+      "--js-flags=--max-old-space-size=512",
+      "--disable-blink-features=AutomationControlled",
+    ],
+  });
+  context = await browser.newContext({
+    viewport: { width: 1366, height: 768 },
+    locale: "en-US",
+    timezoneId: "America/New_York",
+    userAgent:
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+    bypassCSP: true,
+  });
+  await context.addInitScript(() => {
+    Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+    Object.defineProperty(navigator, "plugins", { get: () => [1, 2, 3, 4, 5] });
+    Object.defineProperty(navigator, "languages", { get: () => ["en-US", "en"] });
+    window.chrome = { runtime: {} };
+  });
+  return { browser, context };
 }
 
-/** Tutup paksa browser supaya siklus berikutnya memakai proses baru (anti-OOM). */
 async function resetBrowser() {
-  const p = browserPromise;
-  browserPromise = null;
-  try {
-    const b = await p;
-    await b?.close();
-  } catch { /* ignore */ }
+  if (browser) {
+    try {
+      await browser.close();
+    } catch {}
+  }
+  browser = null;
+  context = null;
 }
 
-/** Ubah kolom `cookies` jsonb akun menjadi cookie Playwright untuk .leonardo.ai */
-function buildCookies(raw) {
-  const c = raw && typeof raw === "object" ? raw : {};
-  const expSec = c.cookies_exp ? Math.floor(new Date(c.cookies_exp).getTime() / 1000) : undefined;
-  const pairs = [
-    ["__Secure-better-auth.session_token", c.session_token],
-    ["__Secure-better-auth.session_data.0", c.session_data_0],
-    ["__Secure-better-auth.session_data.1", c.session_data_1],
-  ];
-  const cookies = [];
-  for (const [name, value] of pairs) {
-    if (!value) continue;
-    cookies.push({
+function signPayload(payload) {
+  const body = JSON.stringify(payload);
+  const sig = crypto.createHmac("sha256", REFRESH_SECRET).update(body).digest("hex");
+  return { body, sig };
+}
+
+async function pushToSupabase(payload) {
+  const { body, sig } = signPayload(payload);
+  const res = await fetch(`${SUPABASE_URL}/functions/v1/leonardo-refresher-sync`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-refresh-signature": sig,
+    },
+    body,
+  });
+  const text = await res.text();
+  if (!res.ok) throw new Error(`sync ${res.status}: ${text}`);
+  return JSON.parse(text || "{}");
+}
+
+async function fetchAccounts(status = "needs_refresh", limit = MAX_PER_CYCLE) {
+  const { data, error } = await supabase
+    .from("leonardo_accounts")
+    .select("*")
+    .eq("status", status)
+    .order("last_refreshed_at", { nullsFirst: true })
+    .limit(limit);
+  if (error) throw error;
+  return data || [];
+}
+
+async function fetchAllProblemAccounts(limit = MAX_PER_CYCLE) {
+  const { data, error } = await supabase
+    .from("leonardo_accounts")
+    .select("*")
+    .in("status", ["needs_refresh", "expired", "error"])
+    .order("last_refreshed_at", { nullsFirst: true })
+    .limit(limit);
+  if (error) throw error;
+  return data || [];
+}
+
+async function setAccountStatus(id, status, details = {}) {
+  const update = {
+    status,
+    last_refreshed_at: new Date().toISOString(),
+    refresh_error: details.error || null,
+    refresh_details: details,
+  };
+  const { error } = await supabase.from("leonardo_accounts").update(update).eq("id", id);
+  if (error) console.error("[setAccountStatus]", error);
+}
+
+function buildCookies(account) {
+  const raw = account.raw_cookies || account.raw || {};
+  const fallback = account.cookies || {};
+  const out = [];
+  const names = new Set([...Object.keys(raw), ...Object.keys(fallback)]);
+  for (const name of names) {
+    const r = raw[name] || {};
+    const f = fallback[name] || {};
+    const value = r.value ?? f.value ?? f;
+    if (value === undefined || value === null || value === "") continue;
+    out.push({
       name,
       value: String(value),
-      domain: ".leonardo.ai",
-      path: "/",
-      httpOnly: true,
-      secure: true,
-      sameSite: "Lax",
-      ...(expSec && expSec > Math.floor(Date.now() / 1000) ? { expires: expSec } : {}),
+      domain: r.domain ?? ".leonardo.ai",
+      path: r.path ?? "/",
+      expires: r.expires ?? -1,
+      httpOnly: r.httpOnly ?? false,
+      secure: r.secure ?? true,
+      sameSite: r.sameSite ?? "Lax",
     });
   }
-  // Dukung juga format array cookie mentah (hasil export extension lama).
-  if (Array.isArray(c.raw)) {
-    for (const item of c.raw) {
-      if (!item?.name || !item?.value) continue;
-      cookies.push({
-        name: item.name,
-        value: String(item.value),
-        domain: item.domain || ".leonardo.ai",
-        path: item.path || "/",
-        httpOnly: item.httpOnly !== false,
-        secure: item.secure !== false,
-        sameSite: "Lax",
-      });
-    }
-  }
-  return cookies;
+  return out;
 }
 
-/** Buka Leonardo memakai cookie akun dan sadap bearer JWT terbaik. */
-async function captureBearer(account) {
-  const cookies = buildCookies(account.cookies);
-  if (!cookies.length) throw new Error("akun belum punya cookie sesi (login ulang sekali via extension)");
+async function captureBearer(page, account, attempt = 1) {
+  const url = "https://app.leonardo.ai/";
+  console.log(`[capture] ${account.email} membuka ${url} (attempt ${attempt})`);
+  await page.goto(url, { waitUntil: "networkidle", timeout: 120000 });
 
-  const browser = await getBrowser();
-  const context = await browser.newContext({
-    userAgent: account.user_agent || USER_AGENT,
-    locale: "en-US",
-    timezoneId: "Asia/Jakarta",
-    viewport: { width: 1440, height: 900 },
-  });
-
-  const found = [];
-  try {
-    await context.addCookies(cookies);
-    const page = await context.newPage();
-
-    // Hemat RAM: blokir aset berat (gambar, video, font, css) — bearer tetap
-    // tertangkap karena hanya request API yang dibutuhkan.
-    await page.route("**/*", (route) => {
-      const type = route.request().resourceType();
-      if (["image", "media", "font", "stylesheet"].includes(type)) return route.abort();
-      return route.continue();
-    });
-
-    page.on("request", (req) => {
-      const auth = req.headers()["authorization"];
-      if (!auth) return;
-      const target = req.url();
-      // Abaikan header Authorization dari domain lain (analitik, dsb).
-      if (!/leonardo\.ai/i.test(target)) return;
-      const jwt = String(auth).replace(/^Bearer\s+/i, "").trim();
-      if (JWT_RE.test(jwt) && isLeonardoApiJwt(jwt)) found.push(jwt);
-    });
-
-    await page.goto("https://app.leonardo.ai/", { waitUntil: "domcontentloaded", timeout: 60000 });
-
-    // Pancing panggilan API asli supaya Bearer Hasura muncul di header request.
-    // Token dari /api/auth/session TIDAK dipakai: itu session better-auth dan
-    // ditolak GraphQL Leonardo (JWSInvalidSignature).
-    try {
-      await page.evaluate(async () => {
-        try { await fetch("/api/rest/getUserDetails", { credentials: "include" }); } catch {}
-      });
-    } catch {
-      /* abaikan, andalkan sniff request */
-    }
-
-    const deadline = Date.now() + PAGE_WAIT_MS;
-    while (Date.now() < deadline) {
-      if (found.some((t) => bearerExpIso(t))) break;
-      await page.waitForTimeout(1000);
-    }
-
-    // Pilih JWT dengan masa berlaku terpanjang.
-    let best = null;
-    let bestExp = 0;
-    for (const t of found) {
-      const iso = bearerExpIso(t);
-      const ms = iso ? new Date(iso).getTime() : 0;
-      if (ms > bestExp) {
-        best = t;
-        bestExp = ms;
-      }
-    }
-    if (!best) throw new Error("bearer tidak tertangkap (cookie mungkin sudah mati)");
-    if (bestExp < Date.now() + 60 * 1000) throw new Error("bearer yang tertangkap sudah kedaluwarsa");
-
-    // Verifikasi pemilik: jangan menimpa akun lain kalau email tidak cocok.
-    const email = bearerEmail(best);
-    const expected = String(account.email || "").toLowerCase();
-    if (email && expected && email !== expected) {
-      throw new Error(`bearer milik ${email}, bukan ${expected}`);
-    }
-
-    // Ambil ulang cookie sesi (better-auth merotasi session_token).
-    const fresh = await context.cookies("https://app.leonardo.ai/");
-    const byName = new Map(fresh.map((c) => [c.name, c.value]));
-    const pick = (...names) => names.map((n) => byName.get(n)).find(Boolean) || null;
-    const tok = pick("__Secure-better-auth.session_token", "better-auth.session_token");
-    const d0 = pick("__Secure-better-auth.session_data.0", "better-auth.session_data.0");
-    const d1 = pick("__Secure-better-auth.session_data.1", "better-auth.session_data.1");
-    const expSec = Math.max(0, ...fresh.map((c) => Number(c.expires || 0)).filter(Boolean));
-
-    return {
-      bearer_token: best,
-      bearer_exp: new Date(bestExp).toISOString(),
-      cookie_session_token: tok || "",
-      cookie_session_data_0: d0 || "",
-      cookie_session_data_1: d1 || "",
-      cookies_exp: expSec ? new Date(expSec * 1000).toISOString() : null,
-    };
-  } finally {
-    await context.close().catch(() => {});
-  }
-}
-
-async function refreshAccount(account) {
-  let captured;
-  // Semua kegagalan (crash Chromium karena RAM kecil, timeout jaringan, cookie
-  // belum termuat) dicoba ulang: tutup browser lama, tunggu, ulangi.
-  let lastError;
-  for (let attempt = 1; attempt <= ACCOUNT_RETRIES; attempt++) {
-    try {
-      captured = await captureBearer(account);
-      lastError = null;
+  // Tunggu checkpoint Vercel selesai (maks 60 detik)
+  for (let i = 0; i < 30; i++) {
+    const currentUrl = page.url();
+    const title = await page.title().catch(() => "");
+    const body = await page.content().catch(() => "");
+    if (
+      currentUrl.includes("app.leonardo.ai") &&
+      !body.includes("Vercel Security Checkpoint") &&
+      !body.includes("Just a moment") &&
+      !title.includes("Security")
+    ) {
       break;
-    } catch (e) {
-      lastError = e;
-      if (attempt === ACCOUNT_RETRIES) break;
-      log(
-        `retry ${attempt}/${ACCOUNT_RETRIES - 1}`,
-        account.label || account.email || account.id,
-        String(e?.message || e).slice(0, 160),
-      );
-      await resetBrowser();
-      await new Promise((r) => setTimeout(r, 3000 * attempt));
     }
+    console.log(`[capture] ${account.email} menunggu checkpoint... (${i + 1}/30)`);
+    await sleep(2000);
   }
-  if (lastError || !captured) throw lastError || new Error("capture gagal tanpa detail");
-  await sync("", {
-    method: "POST",
-    body: JSON.stringify({
-      action: "patch",
-      table: "leonardo_accounts",
-      id: account.id,
-      patch: {
-        ...captured,
-        user_agent: account.user_agent || USER_AGENT,
-        status: "active",
-        is_active: true,
-        last_error: null,
-        last_refresh_at: new Date().toISOString(),
-        refresh_attempts: 0,
-      },
-    }),
-  });
-  return captured.bearer_exp;
-}
 
-async function markFailure(account, message) {
-  try {
-    await sync("", {
-      method: "POST",
-      body: JSON.stringify({
-        action: "patch",
-        table: "leonardo_accounts",
-        id: account.id,
-        patch: {
-          last_error: String(message).slice(0, 500),
-          refresh_attempts: (account.refresh_attempts || 0) + 1,
-          status: "needs_refresh",
-        },
-      }),
+  // Scroll & tunggu API call
+  await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight / 2)).catch(() => {});
+  await sleep(3000);
+
+  let bearer = null;
+  for (let i = 0; i < 40; i++) {
+    const entries = await page.evaluate(() => {
+      try {
+        return performance.getEntriesByType("resource")
+          .filter((r) => r.name.includes("api/"))
+          .map((r) => r.name);
+      } catch {
+        return [];
+      }
     });
-  } catch (e) {
-    log("gagal menandai error", account.id, e.message);
+    for (const name of entries) {
+      const found = await page.evaluate(async (url) => {
+        try {
+          const res = await fetch(url, { credentials: "include" });
+          const token = res.headers.get("authorization") || "";
+          return token.startsWith("Bearer ") ? token.replace("Bearer ", "") : null;
+        } catch {
+          return null;
+        }
+      }, name);
+      if (found) {
+        bearer = found;
+        break;
+      }
+    }
+    if (bearer) break;
+    const cookies = await page.context().cookies(["https://app.leonardo.ai"]);
+    const authCookie = cookies.find((c) => c.name === "__auth__token" || c.name === "authToken");
+    if (authCookie?.value?.startsWith("Bearer ")) {
+      bearer = authCookie.value.replace("Bearer ", "");
+      break;
+    }
+    await sleep(1500);
+  }
+  if (!bearer) throw new Error("bearer tidak tertangkap (checkpoint atau cookie mati)");
+  return bearer;
+}
+
+async function refreshAccount(account, { force = false } = {}) {
+  const { context } = await getBrowser();
+  const cookies = buildCookies(account);
+  const page = await context.newPage();
+  try {
+    await page.context().addCookies(cookies);
+    const bearer = await captureBearer(page, account, force ? 2 : 1);
+
+    // Ambil info user dasar
+    let userId = account.user_id || null;
+    let username = account.username || null;
+    try {
+      const res = await page.evaluate(async (token) => {
+        const r = await fetch("https://api.leonardo.ai/v1/me", {
+          headers: { authorization: `Bearer ${token}` },
+        });
+        return r.json();
+      }, bearer);
+      userId = res?.id || userId;
+      username = res?.username || username;
+    } catch (e) {
+      console.log("[me] gagal ambil info user:", e.message);
+    }
+
+    await pushToSupabase({
+      email: account.email,
+      user_id: userId,
+      username,
+      bearer_token: bearer,
+      cookies: cookies.reduce((acc, c) => {
+        acc[c.name] = { value: c.value, domain: c.domain, path: c.path, expires: c.expires, httpOnly: c.httpOnly, secure: c.secure, sameSite: c.sameSite };
+        return acc;
+      }, {}),
+      raw_cookies: cookies,
+      status: "active",
+      pool: account.pool || null,
+      force,
+    });
+
+    await setAccountStatus(account.id, "active", { ok: true, refreshed_at: now() });
+    console.log(`[refresh] ✅ ${account.email} sukses`);
+    return { ok: true };
+  } catch (err) {
+    console.error(`[refresh] ❌ ${account.email}: ${err.message}`);
+    await setAccountStatus(account.id, "needs_refresh", { error: err.message, at: now() });
+    return { ok: false, error: err.message };
+  } finally {
+    await page.close().catch(() => {});
   }
 }
 
-async function runCycle(reason = "timer", options = {}) {
-  if (running) {
-    // Push manual TIDAK boleh ditolak: tunggu siklus berjalan selesai lalu
-    // langsung jalan. Timer otomatis cukup dilewati (siklus 2 menit berikutnya).
-    if (reason !== "manual") {
-      return { ok: false, skipped: true, reason: "siklus sebelumnya masih berjalan", results: [] };
-    }
-    const deadline = Date.now() + MANUAL_WAIT_MS;
-    log("push manual menunggu siklus berjalan selesai…");
-    while (running && Date.now() < deadline) {
-      await new Promise((r) => setTimeout(r, 1500));
-    }
-    if (running) {
-      return { ok: false, skipped: true, reason: "siklus lain belum selesai setelah menunggu", results: [] };
-    }
+async function runCycle({ force = false, all = false } = {}) {
+  if (isBusy) {
+    console.log("[cycle] masih sibuk, ditolak");
+    return { queued: true };
   }
-  running = true;
-  const results = [];
+  isBusy = true;
+  const start = Date.now();
+  let success = 0;
+  let failed = 0;
   try {
-    const requestedIds = Array.isArray(options.accountIds)
-      ? [...new Set(options.accountIds.map(String))]
-      : [];
-    const forceSelected = options.force === true && requestedIds.length > 0;
-    // POST /run adalah tindakan admin: bila versi dashboard lama belum mengirim
-    // account_ids, tetap proses seluruh akun yang membutuhkan refresh tanpa
-    // dipotong MAX_PER_CYCLE. Batas tersebut hanya berlaku untuk timer otomatis.
-    const forceAllNeeded = reason === "manual" && !forceSelected;
-    const { rows } = await sync(`?action=list&needs=${forceSelected ? "0" : "1"}`);
-    const now = Date.now();
-    const requested = new Set(requestedIds);
-    const candidates = forceSelected ? (rows || []).filter((r) => requested.has(String(r.id))) : (rows || []);
-    // Prioritas: akun rusak / mati dulu, lalu token yang paling cepat kedaluwarsa.
-    // Tanpa ini, list dari server (urut updated_at desc) selalu menaruh akun yang
-    // baru sukses di depan sehingga akun rusak tak pernah masuk MAX_PER_CYCLE.
-    const priority = (r) => {
-      const st = String(r.status || "").toLowerCase();
-      const broken = r.is_active === false || ["needs_refresh", "expired", "error", "invalid"].includes(st);
-      return broken ? 0 : 1;
-    };
-    const expMs = (r) => (r.expires_at ? new Date(r.expires_at).getTime() : 0);
-    const sorted = [...candidates].sort(
-      (a, b) => priority(a) - priority(b) || expMs(a) - expMs(b),
-    );
-    const queue = forceSelected || forceAllNeeded
-      ? sorted
-      : sorted.filter((r) => (cooldown.get(r.id) || 0) <= now).slice(0, MAX_PER_CYCLE);
-    const mode = forceSelected ? "capture paksa terpilih" : forceAllNeeded ? "manual semua kandidat" : "otomatis";
-    log(`siklus ${reason}: ${candidates.length} kandidat, proses ${queue.length} (${mode})`);
+    const accounts = all
+      ? await fetchAllProblemAccounts(MAX_PER_CYCLE)
+      : await fetchAccounts("needs_refresh", MAX_PER_CYCLE);
 
-    // Proses beberapa akun sekaligus supaya pool besar tidak butuh puluhan menit.
-    const pending = [...queue];
-    const worker = async () => {
-      while (pending.length) {
-        const account = pending.shift();
-        if (!account) return;
-        const label = account.label || account.email || account.id;
-        try {
-          const exp = await refreshAccount(account);
-          cooldown.set(account.id, Date.now() + ACCOUNT_COOLDOWN_MS);
-          results.push({ id: account.id, label, status: "refreshed", expires_at: exp });
-          log("✅ refresh", label, "->", exp);
-        } catch (e) {
-          await markFailure(account, e.message);
-          cooldown.set(account.id, Date.now() + FAIL_COOLDOWN_MS);
-          results.push({ id: account.id, label, status: "failed", error: e.message });
-          state.errors += 1;
-          log("❌ refresh gagal", label, e.message);
-        }
-      }
-    };
-    await Promise.all(
-      Array.from({ length: Math.min(CONCURRENCY, pending.length || 1) }, () => worker()),
-    );
+    console.log(`[cycle] ${accounts.length} akun diproses (force=${force}, all=${all})`);
+    if (accounts.length === 0) {
+      isBusy = false;
+      return { ok: true, processed: 0, success: 0, failed: 0 };
+    }
 
-    // Sapuan kedua: akun yang masih gagal dicoba sekali lagi dengan browser baru
-    // supaya "akun mati" tidak dibiarkan gagal begitu saja.
-    const stillFailed = results.filter((r) => r.status === "failed");
-    if (stillFailed.length) {
-      await resetBrowser();
-      log(`sapuan ulang untuk ${stillFailed.length} akun gagal`);
-      for (const failed of stillFailed) {
-        const account = queue.find((r) => String(r.id) === String(failed.id));
-        if (!account) continue;
-        try {
-          const exp = await refreshAccount(account);
-          cooldown.set(account.id, Date.now() + ACCOUNT_COOLDOWN_MS);
-          failed.status = "refreshed";
-          failed.expires_at = exp;
-          delete failed.error;
-          log("✅ refresh (sapuan ulang)", failed.label, "->", exp);
-        } catch (e) {
-          await markFailure(account, e.message);
-          failed.error = e.message;
-          log("❌ tetap gagal", failed.label, e.message);
-        }
+    for (let i = 0; i < accounts.length; i += CONCURRENCY) {
+      const batch = accounts.slice(i, i + CONCURRENCY);
+      const results = await Promise.allSettled(
+        batch.map((a) => refreshAccount(a, { force }))
+      );
+      results.forEach((r) => {
+        if (r.status === "fulfilled" && r.value.ok) success++;
+        else failed++;
+      });
+      if (i + CONCURRENCY < accounts.length) await sleep(2000);
+    }
+
+    // Sapuan kedua untuk yang gagal
+    if (failed > 0 && force) {
+      console.log("[cycle] sapuan kedua untuk akun gagal");
+      const problem = await fetchAllProblemAccounts(MAX_PER_CYCLE);
+      const secondBatch = problem.filter((a) => a.status !== "active").slice(0, MAX_PER_CYCLE);
+      for (let i = 0; i < secondBatch.length; i += CONCURRENCY) {
+        const batch = secondBatch.slice(i, i + CONCURRENCY);
+        const results = await Promise.allSettled(
+          batch.map((a) => refreshAccount(a, { force: true }))
+        );
+        results.forEach((r) => {
+          if (r.status === "fulfilled" && r.value.ok) success++;
+          else failed++;
+        });
       }
     }
-  } catch (e) {
-    state.errors += 1;
-    log("siklus gagal", e.message);
-    results.push({ status: "cycle_error", error: e.message });
+
+    return { ok: true, processed: accounts.length, success, failed, duration_ms: Date.now() - start };
+  } catch (err) {
+    console.error("[cycle] error:", err);
+    return { ok: false, error: err.message };
   } finally {
-    running = false;
-    state.cycles += 1;
-    state.last_cycle_at = new Date().toISOString();
-    state.last_result = results;
-    // Bebaskan memori setelah siklus selesai supaya siklus berikutnya bersih.
-    await resetBrowser();
+    isBusy = false;
+    lastRunAt = Date.now();
   }
-  return { ok: true, results };
 }
 
 app.get("/health", (_req, res) => {
-  res.json({
-    ok: true,
-    service: "leonardo-auto-refresher",
-    configured: !!(SYNC_URL && REFRESHER_SECRET),
-    running,
-    interval_ms: CYCLE_INTERVAL_MS,
-    cooldown_ms: ACCOUNT_COOLDOWN_MS,
-    max_per_cycle: MAX_PER_CYCLE,
-    ...state,
-  });
+  res.json({ ok: true, busy: isBusy, last_run_at: lastRunAt, queue_length: queue.length });
 });
 
-app.post("/run", async (req, res) => {
-  if (CONTROL_SECRET) {
-    const header = req.headers.authorization || "";
-    if (header !== `Bearer ${CONTROL_SECRET}`) return res.status(401).json({ error: "unauthorized" });
-  }
-  const accountIds = Array.isArray(req.body?.account_ids) ? req.body.account_ids : [];
-  const out = await runCycle("manual", {
-    force: req.body?.force === true,
-    accountIds,
-  });
-  res.json(out);
+app.post("/refresh", async (req, res) => {
+  const { force, all, secret } = req.body || {};
+  if (secret !== REFRESH_SECRET) return res.status(401).json({ error: "unauthorized" });
+  const result = await runCycle({ force: !!force, all: !!all });
+  res.json(result);
 });
 
-app.listen(PORT, "0.0.0.0", () => {
-  log(`Leonardo Auto Refresher listening on :${PORT}`);
-  if (!SYNC_URL || !REFRESHER_SECRET) {
-    log("⚠️  SYNC_URL / REFRESHER_SECRET belum diisi — siklus otomatis tidak dijalankan");
-    return;
+app.post("/queue", async (req, res) => {
+  const { secret } = req.body || {};
+  if (secret !== REFRESH_SECRET) return res.status(401).json({ error: "unauthorized" });
+  if (isBusy) {
+    queue.push(req.body);
+    return res.json({ queued: true, position: queue.length });
   }
-  runCycle("boot").catch((e) => log("boot cycle error", e.message));
-  setInterval(() => {
-    runCycle("timer").catch((e) => log("timer cycle error", e.message));
-  }, CYCLE_INTERVAL_MS);
+  const result = await runCycle({ force: !!req.body.force, all: !!req.body.all });
+  res.json(result);
+});
+
+async function backgroundLoop() {
+  while (true) {
+    try {
+      if (!isBusy && Date.now() - lastRunAt > COOLDOWN_MS) {
+        await runCycle({ all: true });
+      }
+      await sleep(FUNCTION_COOLDOWN_MS);
+    } catch (err) {
+      console.error("[backgroundLoop] crash:", err);
+      await resetBrowser();
+      await sleep(10000);
+    }
+  }
+}
+
+app.listen(PORT, () => {
+  console.log(`[server] VPS Leonardo Refresher berjalan di port ${PORT}`);
+  backgroundLoop();
 });

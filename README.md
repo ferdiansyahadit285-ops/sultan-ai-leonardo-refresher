@@ -1,0 +1,67 @@
+# Sultan AI — Leonardo Auto Refresher (VPS/Railway) v4.3.0
+
+Service 24/7 yang menjaga bearer JWT semua akun pool Leonardo tetap hidup tanpa
+PC user. Membuka `app.leonardo.ai` dengan cookie sesi tiap akun memakai Chromium
+stealth + proxy residensial sticky, menyadap Bearer asli, lalu menyimpannya lewat
+Edge Function `leonardo-refresher-sync`.
+
+## Yang diperbaiki di v4
+
+| Masalah lama | Perbaikan v4 |
+|---|---|
+| Selalu kena "Vercel Security Checkpoint" → `bearer tidak tertangkap` | `playwright-extra` + plugin stealth, script/CSS/WASM tidak diblokir, tunggu challenge sampai 75 s |
+| Semua akun keluar dari 1 IP datacenter Railway | Proxy residensial **sticky per akun** dari pool `proxy_credentials`; percobaan ulang otomatis ganti IP |
+| Push ulang dari dashboard timeout 150 s | `POST /run` balas **202 seketika**, kerja di latar belakang |
+| Push manual 0 sukses 0 gagal | Antrian manual prioritas, tanpa cooldown & tanpa `MAX_PER_CYCLE` |
+| Chromium → OOM "Page crashed" | Default satu proses (`CONCURRENCY=1`) dan browser ditutup tiap akun |
+| Proxy/browser gagal membuat akun ditandai mati | Gangguan infrastruktur dicatat terpisah dan tidak mengubah status akun |
+| Cookie lama disimpan tanpa atribut | Menyimpan `raw_cookies` lengkap (host-only benar) |
+| Siklus otomatis berhenti setelah 3 akun | Tetap memakai batch kecil agar stabil, lalu otomatis lanjut ke batch berikutnya sampai antrean habis |
+| Akun mati membuat token aktif ikut menumpuk | Akun aktif yang paling cepat kedaluwarsa diprioritaskan sebelum akun yang sudah mati |
+
+## Deploy (Railway lewat GitHub)
+
+1. Upload isi folder `vps-leonardo-refresher/` ke repo GitHub (ganti file lama).
+2. Railway → service Docker, root directory `vps-leonardo-refresher`.
+3. Environment variables (lihat `.env.example`):
+   - `SYNC_URL` = URL Edge Function `leonardo-refresher-sync`
+   - `SUPABASE_ANON_KEY` = publishable key proyek
+   - `REFRESHER_SECRET` = nilai `LEONARDO_REFRESH_SECRET`
+   - opsional: `CONCURRENCY=1`, `USE_PROXY=1`
+4. Tunggu deploy, buka `GET /health` sampai `configured: true`.
+
+VPS sendiri:
+
+```bash
+cd vps-leonardo-refresher
+docker build -t sultan-leo-refresher .
+docker run -d --restart=always -p 8090:8080 --env-file .env sultan-leo-refresher
+```
+
+## Endpoint
+
+- `GET /health` — status, `refreshed_total`, hasil siklus terakhir (tanpa auth)
+- `POST /run` — `{ account_ids?: string[], force?: boolean }`, header
+  `Authorization: Bearer <REFRESHER_SECRET>`; balas 202 lalu kerja di background
+
+## Cara kerja
+
+1. Tiap `CYCLE_INTERVAL_MS` (2 menit) memanggil `?action=list&needs=1`: akun
+   `needs_refresh`/`expired`/`error` atau token kedaluwarsa < 10 menit.
+2. Prioritas: token akun aktif yang paling cepat mati, lalu akun yang sudah rusak.
+   Tiap batch dibatasi agar Chromium stabil, tetapi batch berikutnya langsung
+   berjalan otomatis sampai semua akun yang perlu refresh selesai.
+3. Tiap akun: ambil proxy sticky (`?action=proxy_pick`), buka Leonardo dengan
+   cookie sesi, lewati checkpoint, sadap Bearer dari header CDP.
+4. Bearer diverifikasi: JWT Hasura/Cognito, belum kedaluwarsa, email cocok.
+5. Cookie hasil rotasi disimpan ulang (termasuk `raw_cookies`); token disebar ke
+   duplikat pool oleh Edge Function.
+
+## Catatan
+
+- Cookie sesi awal tetap perlu diambil sekali dari browser login (extension
+  capture). Sesudah tersimpan, service ini yang meneruskan selamanya.
+- Akun login lewat **Canva/Google (federated)** tidak punya `refresh_token`,
+  jadi cron `leonardo-refresh` (Cognito) tidak bisa menolong — hanya service ini.
+- Kalau satu akun tetap gagal dengan pesan `security checkpoint tidak selesai`,
+  proxy-nya sedang diblokir; percobaan berikutnya otomatis memakai IP lain.

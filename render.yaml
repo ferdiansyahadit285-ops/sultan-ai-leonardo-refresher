@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: sultan-ai-leonardo-refresher
+    env: docker
+    plan: starter
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - key: SYNC_URL
+        sync: false
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      - key: REFRESHER_SECRET
+        sync: false
+      - key: CYCLE_INTERVAL_MS
+        value: "120000"
+      - key: ACCOUNT_COOLDOWN_MS
+        value: "900000"
+      - key: MAX_PER_CYCLE
+        value: "20"
+      - key: CONCURRENCY
+        value: "3"

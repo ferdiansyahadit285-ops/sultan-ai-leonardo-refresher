@@ -1,0 +1,12 @@
+{
+  "name": "sultan-leonardo-refresher",
+  "version": "4.6.0",
+  "private": true,
+  "scripts": { "start": "node server.js" },
+  "dependencies": {
+    "express": "4.21.2",
+    "playwright": "1.62.1",
+    "playwright-extra": "4.3.6",
+    "puppeteer-extra-plugin-stealth": "2.11.2"
+  }
+}
